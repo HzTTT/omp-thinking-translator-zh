@@ -29,7 +29,11 @@ type TranslationView = { completed: number; total: number; rows: string[] };
 type ResolvedTranslatorConfig = {
 	enabled: boolean;
 	targetLanguage: string;
-	translatorModel?: ModelRef;
+	/**
+	 * 按顺序回退的翻译模型链：每一行的每一轮请求都从第一个开始，前一个失败（不在注册表、鉴权、
+	 * 流错误、空响应）才换下一个。不记住哪个模型上次失败或成功，下一行仍先用第一个。
+	 */
+	translatorModels: readonly ModelRef[];
 	/**
 	 * 诊断记录（事件、分发、请求、渲染、迟到通知）的落点：默认写在会话文件旁边的
 	 * `<会话文件名>.thinking-translator-trace.jsonl`；字符串改成指定路径，`false` 关闭。
@@ -69,11 +73,12 @@ const CONFIG_FILE_NAME = "thinking-translator.json";
 const DEFAULT_CONFIG: ResolvedTranslatorConfig = {
 	enabled: true,
 	targetLanguage: "Simplified Chinese",
+	translatorModels: [],
 	trace: true,
 };
 /** notify 行的去抖窗口；用于合并同一轮内接连完成的译文。 */
 const LATE_NOTIFY_DEBOUNCE_MS = 400;
-/** 翻译模型不在线或限流时的退避重试间隔；用尽才把这一行标成失败。 */
+/** 整条模型链都失败后的退避间隔：每一轮都从第一个模型重新开始；用尽才把这一行标成失败。 */
 const RETRY_DELAYS_MS = [500, 2000, 6000];
 /** 追踪的 thinking 块上限：更早的块早已提交进历史，译文也已在缓存里。 */
 const MAX_TRACKED_BLOCKS = 32;
@@ -94,15 +99,15 @@ function resolveTraceFile(config: ResolvedTranslatorConfig, sessionFile: string 
 }
 /**
  * 翻译模型不在注册表里时，由扩展自己触发该 provider 的模型发现（宿主只为主模型做这件事；
- * proxy 发现的模型在缓存过期、静态重载后会从注册表消失）。同一 provider 两次发现之间的最短间隔。
+ * proxy 发现的模型在缓存过期、静态重载后会从注册表消失）。不设冷却、不记失败：每次用到这个模型
+ * 都重新查注册表、查不到就重新发现；只把同一 provider 正在进行的那一次发现合并给并发的行，结束即删。
  */
-const MODEL_DISCOVERY_COOLDOWN_MS = 60_000;
+const discoveryInFlight = new Map<string, Promise<void>>();
 /** 宿主 `Effort` 的全部取值；用 Record 表达，宿主增删等级时类型检查会在这里报错。 */
 const EFFORT_LEVELS: Readonly<Record<`${Effort}`, true>> = { minimal: true, low: true, medium: true, high: true, xhigh: true, max: true };
-const lastModelDiscoveryAt = new Map<string, number>();
 const configErrorNotified = new Set<string>();
 const translationFailureNotified = new Set<string>();
-let missingModelWarningKey: string | undefined;
+const missingModelNotified = new Set<string>();
 
 /** 译文只附着在可见 thinking 下方，不写入会话或模型上下文。 */
 export default function thinkingTranslator(pi: ExtensionAPI) {
@@ -323,7 +328,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		configErrorNotified.clear();
 		requestRender = undefined;
 		translationFailureNotified.clear();
-		missingModelWarningKey = undefined;
+		missingModelNotified.clear();
 	}
 	pi.on("session_start", (_event, ctx) => {
 		resetTranslations("session_start");
@@ -350,6 +355,10 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		if (!ctx || sources.length === 0) return;
 		const config = (activeConfig ??= loadConfig(ctx));
 		if (!config.enabled) return;
+		if (config.translatorModels.length === 0) {
+			notifyMissingModel(ctx, "not-configured", "thinking-translator enabled but translatorModels is empty; translation skipped");
+			return;
+		}
 		// 展示行先映射回原文里的整行：揭示中的变体（缺句号、省略号收尾）与最终展示共用同一格。
 		const missing: string[] = [];
 		for (const line of sources) {
@@ -361,29 +370,14 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		trace("dispatch", { blockLabel, sources: sources.length, missing: missing.length });
 		const signal = controller.signal;
 		// 先占格：模型解析可能要等一次网络发现，期间的重绘不能再为同一行发起分发。
-		const pending: [string, TranslationCell][] = [];
 		for (const line of missing) {
 			const key = cellKey(config, line);
 			// 同一次分发里的重复行共用一格。
 			if (translations.has(key)) continue;
 			const cell: TranslationCell = { progress: { status: "pending" }, painted: false };
 			translations.set(key, cell);
-			pending.push([line, cell]);
+			void translateLine(cell, line, ctx, config, signal, notify).then(() => noteTranslationSettled(cell, blockLabel, signal));
 		}
-		void resolveTranslatorModel(ctx, config).then((model) => {
-			trace("resolve", { blockLabel, found: model !== undefined, aborted: signal.aborted, pending: pending.length });
-			if (signal.aborted) return;
-			if (!model) {
-				// 撤回占位：注册表里暂时没有这个模型，让之后的重绘在冷却期后再试，而不是永久跳过。
-				for (const [line, cell] of pending) {
-					if (translations.get(cellKey(config, line)) === cell) translations.delete(cellKey(config, line));
-				}
-				return;
-			}
-			for (const [line, cell] of pending) {
-				void translateLine(cell, line, ctx, config, model, signal, notify).then(() => noteTranslationSettled(cell, blockLabel, signal));
-			}
-		});
 	}
 
 	/**
@@ -405,7 +399,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		activeConfig = loadConfig(ctx);
 		traceFile = resolveTraceFile(activeConfig, ctx.sessionManager.getSessionFile());
 		messageSeq++;
-		trace("message_start", { messageSeq, hasNotify: typeof ctx.ui?.notify === "function", cwd: ctx.cwd, enabled: activeConfig.enabled, model: activeConfig.translatorModel });
+		trace("message_start", { messageSeq, hasNotify: typeof ctx.ui?.notify === "function", cwd: ctx.cwd, enabled: activeConfig.enabled, models: activeConfig.translatorModels.map(modelLabel) });
 		// 上一条消息的块原文要留着：它的组件还在被重绘，逐行匹配得拿自己那份原文。
 		for (const key of liveBlocks.keys()) {
 			if (liveBlocks.size <= MAX_TRACKED_BLOCKS) break;
@@ -461,32 +455,48 @@ function cellBody(cell: TranslationCell): string | undefined {
 	}
 }
 
-/** 每行独立请求并立即消费增量，避免慢行阻塞同块其他译文。 */
+/**
+ * 每行独立请求并立即消费增量，避免慢行阻塞同块其他译文。
+ * 每一轮都按配置顺序从第一个模型开始，前一个失败才换下一个；整条链都失败才退避，下一轮又从第一个开始。
+ * 哪个模型失败过不留任何记忆：下一行、下一轮都先用第一个。
+ */
 async function translateLine(
 	cell: TranslationCell,
 	source: string,
 	ctx: ExtensionContext,
 	config: ResolvedTranslatorConfig,
-	translatorModel: Model<Api>,
 	signal: AbortSignal,
 	requestRender: () => void,
 ): Promise<void> {
-	for (let attempt = 0; ; attempt++) {
-		try {
-			await streamTranslation(cell, source, ctx, config, translatorModel, signal, requestRender);
-			return;
-		} catch (error) {
-			if (signal.aborted) return;
-			const message = error instanceof Error ? error.message : String(error);
-			// 翻译模型不在线、限流、连接中断都是可恢复的：退避重试，中途保持"等待"而不是先报错。
-			if (attempt + 1 < RETRY_DELAYS_MS.length + 1 && (await sleepUnlessAborted(RETRY_DELAYS_MS[attempt]!, signal))) continue;
-			if (signal.aborted) return;
-			trace("translateError", { message, attempts: attempt + 1 });
-			cell.progress = { status: "error", error: message };
-			requestRender();
-			notifyTranslationFailure(ctx, error);
-			return;
+	for (let round = 0; ; round++) {
+		const failures: string[] = [];
+		for (const modelRef of config.translatorModels) {
+			try {
+				const model = await resolveModel(ctx, modelRef);
+				if (signal.aborted) return;
+				await streamTranslation(cell, source, ctx, config.targetLanguage, model, modelRef.effort, signal, requestRender);
+				return;
+			} catch (error) {
+				if (signal.aborted) return;
+				const message = `${modelLabel(modelRef)}: ${error instanceof Error ? error.message : String(error)}`;
+				trace("modelFailed", { source: source.slice(0, 40), round, message });
+				failures.push(message);
+				// 换下一个模型前撤掉上一个模型流了一半的译文，不让两份译文拼在一起。
+				if (cell.progress.status !== "pending") {
+					cell.progress = { status: "pending" };
+					requestRender();
+				}
+			}
 		}
+		// 翻译模型不在线、限流、连接中断都是可恢复的：退避重试，中途保持"等待"而不是先报错。
+		if (round < RETRY_DELAYS_MS.length && (await sleepUnlessAborted(RETRY_DELAYS_MS[round]!, signal))) continue;
+		if (signal.aborted) return;
+		const message = failures.join("; ");
+		trace("translateError", { message, rounds: round + 1 });
+		cell.progress = { status: "error", error: message };
+		requestRender();
+		notifyTranslationFailure(ctx, message);
+		return;
 	}
 }
 
@@ -506,20 +516,20 @@ function sleepUnlessAborted(delay: number, signal: AbortSignal): Promise<boolean
 	return promise;
 }
 
-/** 一次请求的完整消费；任何失败都抛给上层决定是否重试。 */
+/** 用一个已解析的模型完成一次请求；任何失败都抛给上层换下一个模型。 */
 async function streamTranslation(
 	cell: TranslationCell,
 	source: string,
 	ctx: ExtensionContext,
-	config: ResolvedTranslatorConfig,
+	targetLanguage: string,
 	translatorModel: Model<Api>,
+	effort: EffortSetting | undefined,
 	signal: AbortSignal,
 	requestRender: () => void,
 ): Promise<void> {
 	const auth = await getTranslatorAuth(ctx, translatorModel);
 	if (signal.aborted) return;
-	const prompt = buildTranslationPrompt(source, config.targetLanguage);
-	const effort = config.translatorModel?.effort;
+	const prompt = buildTranslationPrompt(source, targetLanguage);
 	trace("request", { source: source.slice(0, 60), model: `${translatorModel.provider}/${translatorModel.id}`, effort: effort ?? "default", hasKey: auth.apiKey !== undefined });
 	// streamSimple 是 pi-ai 唯一把 reasoning/disableReasoning 映射成各 provider wire 字段的入口。
 	const eventStream = streamSimple(
@@ -546,10 +556,14 @@ async function streamTranslation(
 	requestRender();
 }
 
-/** 键里带上模型、推理强度与目标语言，改配置后不会复用上一轮的译文。 */
+/** 键里带上整条模型链（含各自的推理强度）与目标语言，改配置后不会复用上一轮的译文。 */
 function cellKey(config: ResolvedTranslatorConfig, line: string): string {
-	const model = config.translatorModel;
-	return `${model ? `${model.provider}/${model.id}@${model.effort ?? "default"}` : "-"}\u0000${config.targetLanguage}\u0000${line}`;
+	const chain = config.translatorModels.map((model) => `${modelLabel(model)}@${model.effort ?? "default"}`).join(">") || "-";
+	return `${chain}\u0000${config.targetLanguage}\u0000${line}`;
+}
+
+function modelLabel(model: ModelRef): string {
+	return `${model.provider}/${model.id}`;
 }
 
 /**
@@ -672,7 +686,7 @@ function loadConfigState(ctx?: NotifierContext): ConfigState {
 	return { config, paths, errors };
 }
 
-/** 项目层可只覆盖模型的 provider/id 或其他局部字段。 */
+/** 项目层按字段覆盖；`translatorModels` 是有序链，覆盖时整条替换。 */
 function mergeConfig(base: ResolvedTranslatorConfig, value: unknown): ResolvedTranslatorConfig {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config must be an object");
 	const raw = value as Record<string, unknown>;
@@ -682,26 +696,32 @@ function mergeConfig(base: ResolvedTranslatorConfig, value: unknown): ResolvedTr
 	return {
 		enabled: typeof raw.enabled === "boolean" ? raw.enabled : base.enabled,
 		targetLanguage: typeof raw.targetLanguage === "string" ? raw.targetLanguage : base.targetLanguage,
-		translatorModel: normalizeTranslatorModel(raw.translatorModel, base.translatorModel),
+		translatorModels: normalizeTranslatorModels(raw.translatorModels, base.translatorModels),
 		trace: raw.trace === null ? true : typeof raw.trace === "boolean" ? raw.trace : typeof raw.trace === "string" && raw.trace.trim() ? raw.trace : base.trace,
 	};
 }
 
-/** 只有 provider 和 id 都存在时才把模型引用视为可用；effort 与二者一样按字段覆盖，`null` 清除。 */
-function normalizeTranslatorModel(value: unknown, fallback?: ModelRef): ModelRef | undefined {
+/** 未设置沿用下层，`null` 清空；每一项都必须是完整的 `{ provider, id, effort? }`，任何一项不合法都让整份配置无效。 */
+function normalizeTranslatorModels(value: unknown, fallback: readonly ModelRef[]): readonly ModelRef[] {
 	if (value === undefined) return fallback;
-	if (!value || typeof value !== "object") return undefined;
+	if (value === null) return [];
+	if (!Array.isArray(value)) throw new Error("translatorModels must be an array of { provider, id, effort? }");
+	return value.map((entry, index) => parseModelRef(entry, `translatorModels[${index}]`));
+}
+
+function parseModelRef(value: unknown, path: string): ModelRef {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${path} must be an object { provider, id, effort? }`);
 	const raw = value as Record<string, unknown>;
-	const provider = typeof raw.provider === "string" ? raw.provider : fallback?.provider;
-	const id = typeof raw.id === "string" ? raw.id : fallback?.id;
-	const effort = raw.effort === undefined ? fallback?.effort : raw.effort === null ? undefined : parseEffortSetting(raw.effort);
-	return provider && id ? { provider, id, ...(effort ? { effort } : {}) } : undefined;
+	if (typeof raw.provider !== "string" || !raw.provider.trim()) throw new Error(`${path}.provider must be a non-empty string`);
+	if (typeof raw.id !== "string" || !raw.id.trim()) throw new Error(`${path}.id must be a non-empty string`);
+	const effort = raw.effort === undefined || raw.effort === null ? undefined : parseEffortSetting(raw.effort, `${path}.effort`);
+	return { provider: raw.provider, id: raw.id, ...(effort ? { effort } : {}) };
 }
 
 /** 配置边界：只接受 `off` 与宿主等级；其他值抛错，交给配置错误策略禁用翻译，拼错不会静默回落默认。 */
-function parseEffortSetting(value: unknown): EffortSetting {
+function parseEffortSetting(value: unknown, path: string): EffortSetting {
 	if (value === "off" || (typeof value === "string" && isEffortLevel(value))) return value;
-	throw new Error(`translatorModel.effort must be one of: off, ${Object.keys(EFFORT_LEVELS).join(", ")}`);
+	throw new Error(`${path} must be one of: off, ${Object.keys(EFFORT_LEVELS).join(", ")}`);
 }
 
 function isEffortLevel(value: string): value is `${Effort}` {
@@ -717,80 +737,70 @@ function notifyConfigLoadError(ctx: NotifierContext | undefined, path: string, e
 }
 
 /**
- * 找不到翻译模型时先让宿主发现一次该 provider 的模型再查；仍找不到只警告并跳过，不影响主对话。
+ * 每次请求都现查宿主注册表；查不到先让宿主发现一次该 provider 的模型再查，仍查不到就抛错，由调用方换下一个模型。
  * 宿主的注册表只为当前主模型恢复 discovery 结果，翻译模型所在的 proxy provider 没人负责：
  * 缓存过期或静态重载后它的模型会整体从 `find` 里消失，长会话里因此"曾经能翻，后来不翻"。
  */
-async function resolveTranslatorModel(ctx: ExtensionContext, config: ResolvedTranslatorConfig): Promise<Model<Api> | undefined> {
-	const modelRef = config.translatorModel;
-	if (!modelRef) {
-		notifyMissingModel(ctx, "not-configured", "thinking-translator enabled but translatorModel is not configured; translation skipped");
-		return undefined;
-	}
-	const model = ctx.modelRegistry.find(modelRef.provider, modelRef.id) ?? (await discoverTranslatorModel(ctx, modelRef));
-	if (!model) {
-		notifyMissingModel(
-			ctx,
-			`${modelRef.provider}/${modelRef.id}`,
-			`thinking-translator model not found: ${modelRef.provider}/${modelRef.id}; translation skipped, will retry discovery in ${MODEL_DISCOVERY_COOLDOWN_MS / 1000}s`,
-		);
-		return undefined;
-	}
-	missingModelWarningKey = undefined;
-	return model;
+async function resolveModel(ctx: ExtensionContext, modelRef: ModelRef): Promise<Model<Api>> {
+	const model = ctx.modelRegistry.find(modelRef.provider, modelRef.id) ?? (await discoverModel(ctx, modelRef));
+	if (model) return model;
+	notifyMissingModel(ctx, modelLabel(modelRef), `thinking-translator model not found: ${modelLabel(modelRef)}; skipped for this request, the next configured model (if any) is tried`);
+	throw new Error("model not found in registry after discovery");
 }
 
-/** 触发一次在线发现并重查；冷却期内直接返回未命中，避免每次重绘都打网络。 */
-async function discoverTranslatorModel(ctx: ExtensionContext, modelRef: ModelRef): Promise<Model<Api> | undefined> {
-	const now = Date.now();
-	const last = lastModelDiscoveryAt.get(modelRef.provider);
-	if (last !== undefined && now - last < MODEL_DISCOVERY_COOLDOWN_MS) return undefined;
-	lastModelDiscoveryAt.set(modelRef.provider, now);
-	// 发现失败（网络、鉴权）由宿主记进它自己的 discovery 状态；这里只关心之后能不能查到。
-	await ctx.modelRegistry.refreshDiscoverableProviders([modelRef.provider], "online").catch(() => undefined);
+/** 发现失败（网络、鉴权）由宿主记进它自己的 discovery 状态；这里只关心之后能不能查到。 */
+async function discoverModel(ctx: ExtensionContext, modelRef: ModelRef): Promise<Model<Api> | undefined> {
+	let running = discoveryInFlight.get(modelRef.provider);
+	if (!running) {
+		running = ctx.modelRegistry
+			.refreshDiscoverableProviders([modelRef.provider], "online")
+			.then(
+				() => undefined,
+				() => undefined,
+			)
+			.finally(() => discoveryInFlight.delete(modelRef.provider));
+		discoveryInFlight.set(modelRef.provider, running);
+	}
+	await running;
 	return ctx.modelRegistry.find(modelRef.provider, modelRef.id);
 }
 
-/** 同一种模型缺失问题只提示一次。 */
+/** 同一种模型缺失问题每个会话只提示一次。 */
 function notifyMissingModel(ctx: NotifierContext, key: string, message: string): void {
-	if (missingModelWarningKey === key) return;
-	missingModelWarningKey = key;
+	if (missingModelNotified.has(key)) return;
+	missingModelNotified.add(key);
 	trace("missingModel", { key });
 	ctx.ui?.notify?.(message, "warning");
 }
 
 /** 按错误消息去重，避免并发行的同类失败刷屏。 */
-function notifyTranslationFailure(ctx: NotifierContext, error: unknown): void {
-	const message = error instanceof Error ? error.message : String(error);
+function notifyTranslationFailure(ctx: NotifierContext, message: string): void {
 	if (translationFailureNotified.has(message)) return;
 	translationFailureNotified.add(message);
 	ctx.ui?.notify?.("thinking translation failed: " + message, "warning");
 }
 
-/** 展示配置来源和模型可用性，帮助用户判断需要修改哪个 JSON；模型不在注册表时先强制发现一次再报。 */
+/** 按链的顺序展示每个模型的可用性，帮助用户判断需要修改哪个 JSON；不在注册表的模型先发现一次再报。 */
 async function showConfigStatus(ctx: ExtensionContext): Promise<void> {
 	const state = loadConfigState(ctx);
-	const modelRef = state.config.translatorModel;
-	let model: Model<Api> | undefined;
-	let modelStatus = "not configured";
-	if (modelRef) {
-		model = ctx.modelRegistry.find(modelRef.provider, modelRef.id);
-		if (model) modelStatus = "available";
-		else {
-			lastModelDiscoveryAt.delete(modelRef.provider);
-			model = await discoverTranslatorModel(ctx, modelRef);
+	const modelLines: string[] = [];
+	for (const [index, modelRef] of state.config.translatorModels.entries()) {
+		let model = ctx.modelRegistry.find(modelRef.provider, modelRef.id);
+		let modelStatus = "available";
+		if (!model) {
+			model = await discoverModel(ctx, modelRef);
 			modelStatus = model ? "available (after discovery)" : "not found (after discovery)";
 		}
+		// 支持哪些等级以模型目录为准；这里只展示，供用户对照 effort 设置。
+		const modelEfforts = !model ? "unknown" : !model.reasoning ? "none (non-reasoning model)" : model.thinking?.efforts.join(", ") || "none (no effort control)";
+		modelLines.push(`  ${index + 1}. ${modelLabel(modelRef)}: ${modelStatus}; effort: ${modelRef.effort ?? "model default"} (model supports: ${modelEfforts})`);
 	}
-	// 支持哪些等级以模型目录为准；这里只展示，供用户对照 effort 设置。
-	const modelEfforts = !model ? "unknown" : !model.reasoning ? "none (non-reasoning model)" : model.thinking?.efforts.join(", ") || "none (no effort control)";
 	const lines = [
 		"thinking-translator status",
 		`enabled: ${state.config.enabled}`,
 		`targetLanguage: ${state.config.targetLanguage}`,
-		`translatorModel: ${modelRef ? `${modelRef.provider}/${modelRef.id}` : "not configured"}`,
-		`model: ${modelStatus}`,
-		`effort: ${modelRef?.effort ?? "model default"} (model supports: ${modelEfforts})`,
+		modelLines.length > 0 ? "translatorModels (tried in order, every request starts at 1):" : "translatorModels: not configured",
+		...modelLines,
 		`trace: ${resolveTraceFile(state.config, ctx.sessionManager.getSessionFile()) ?? "off"}`,
 		...state.paths.map((info) => `${info.scope} config: ${info.path} (${info.exists ? "found" : "not found"})`),
 		...state.errors.map((item) => `${item.scope} config error: ${item.error instanceof Error ? item.error.message : String(item.error)}`),
@@ -822,7 +832,7 @@ function initConfigFile(ctx: ExtensionContext, scope: "global" | "project"): voi
 		) + "\n",
 		"utf8",
 	);
-	ctx.ui.notify(`created ${scope} config: ${path}\nAdd translatorModel and set enabled to true when ready.`, "info");
+	ctx.ui.notify(`created ${scope} config: ${path}\nAdd translatorModels and set enabled to true when ready.`, "info");
 }
 
 /** 要求直译而非响应源文本指令，避免翻译任务变成第二次推理。 */
@@ -892,7 +902,7 @@ export const __testing = {
 	getProjectConfigPath,
 	getGlobalConfigPath,
 	mergeConfig,
-	normalizeTranslatorModel,
+	normalizeTranslatorModels,
 	reasoningOptions,
 	shouldTranslateLine,
 	splitTranslationLines,

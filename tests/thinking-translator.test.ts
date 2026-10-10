@@ -20,23 +20,25 @@ test("a short single-line thinking block is translatable", () => {
 test("legacy and unknown fields are ignored without losing valid overrides", () => {
 	const config = __testing.mergeConfig(__testing.DEFAULT_CONFIG, {
 		contentTypes: ["text"], extra: 123, targetLanguage: "Japanese",
-		translatorModel: { provider: "faux", id: "translator" },
+		translatorModel: { provider: "old", id: "single" },
+		translatorModels: [{ provider: "faux", id: "translator" }],
 	});
 	assert.equal(config.targetLanguage, "Japanese");
-	assert.deepEqual(config.translatorModel, { provider: "faux", id: "translator" });
+	assert.deepEqual(config.translatorModels, [{ provider: "faux", id: "translator" }]);
 	assert.equal("contentTypes" in config, false);
 	assert.equal("extra" in config, false);
+	assert.equal("translatorModel" in config, false);
 });
 
 test("invalid known fields fail closed instead of enabling unexpected requests", () => {
 	for (const value of [null, [], { enabled: "yes" }, { targetLanguage: "" }]) {
 		assert.throws(() => __testing.mergeConfig(__testing.DEFAULT_CONFIG, value));
 	}
-	// 拼错或类型不对的 effort 让整份配置无效，而不是静默回落到模型默认强度。
+	// 拼错或类型不对的 effort 让整份配置无效，而不是静默回落到模型默认强度；报错指明是链上的第几个。
 	for (const effort of ["fast", "Low", "", 1, true]) {
 		assert.throws(
-			() => __testing.mergeConfig(__testing.DEFAULT_CONFIG, { translatorModel: { provider: "bansos", id: "m", effort } }),
-			/translatorModel\.effort must be one of: off, minimal, low, medium, high, xhigh, max/,
+			() => __testing.mergeConfig(__testing.DEFAULT_CONFIG, { translatorModels: [{ provider: "bansos", id: "a" }, { provider: "bansos", id: "m", effort }] }),
+			/translatorModels\[1\]\.effort must be one of: off, minimal, low, medium, high, xhigh, max/,
 		);
 	}
 });
@@ -47,32 +49,28 @@ test("the removed minLatinChars key is ignored instead of gating translation", (
 	assert.equal("minLatinChars" in layered, false);
 });
 
-test("mergeConfig supports partial translatorModel overlay and null clears", () => {
-	const baseWithModel = __testing.mergeConfig(__testing.DEFAULT_CONFIG, {
-		translatorModel: { provider: "ollama", id: "qwen2.5:7b" },
+test("translatorModels keeps the configured order and effort per entry", () => {
+	const chain = __testing.mergeConfig(__testing.DEFAULT_CONFIG, {
+		translatorModels: [
+			{ provider: "bansos", id: "first", effort: "minimal" },
+			{ provider: "deepseek", id: "second" },
+			{ provider: "ollama", id: "third", effort: null },
+		],
 	});
-	const providerOverlay = __testing.mergeConfig(baseWithModel, {
-		translatorModel: { provider: "openai" },
-	});
-	assert.deepEqual(providerOverlay.translatorModel, { provider: "openai", id: "qwen2.5:7b" });
-	const idOverlay = __testing.mergeConfig(baseWithModel, {
-		translatorModel: { id: "gpt-4o-mini" },
-	});
-	assert.deepEqual(idOverlay.translatorModel, { provider: "ollama", id: "gpt-4o-mini" });
-	const cleared = __testing.mergeConfig(baseWithModel, { translatorModel: null });
-	assert.equal(cleared.translatorModel, undefined);
-	const preserved = __testing.mergeConfig(baseWithModel, {});
-	assert.deepEqual(preserved.translatorModel, { provider: "ollama", id: "qwen2.5:7b" });
+	assert.deepEqual(chain.translatorModels, [
+		{ provider: "bansos", id: "first", effort: "minimal" },
+		{ provider: "deepseek", id: "second" },
+		{ provider: "ollama", id: "third" },
+	]);
 });
 
-test("effort layers per field like provider and id, and null clears it", () => {
+test("a project translatorModels replaces the whole global chain, null clears it, absence keeps it", () => {
 	const global = __testing.mergeConfig(__testing.DEFAULT_CONFIG, {
-		translatorModel: { provider: "bansos", id: "muse", effort: "low" },
+		translatorModels: [{ provider: "bansos", id: "a", effort: "low" }, { provider: "bansos", id: "b" }],
 	});
-	// 项目只换模型 id 时保留全局的 effort；只改 effort 时保留全局的模型。
-	assert.deepEqual(__testing.mergeConfig(global, { translatorModel: { id: "ultra" } }).translatorModel, { provider: "bansos", id: "ultra", effort: "low" });
-	assert.deepEqual(__testing.mergeConfig(global, { translatorModel: { effort: "off" } }).translatorModel, { provider: "bansos", id: "muse", effort: "off" });
-	assert.deepEqual(__testing.mergeConfig(global, { translatorModel: { effort: null } }).translatorModel, { provider: "bansos", id: "muse" });
+	assert.deepEqual(__testing.mergeConfig(global, { translatorModels: [{ provider: "ollama", id: "c" }] }).translatorModels, [{ provider: "ollama", id: "c" }]);
+	assert.deepEqual(__testing.mergeConfig(global, { translatorModels: null }).translatorModels, []);
+	assert.deepEqual(__testing.mergeConfig(global, {}).translatorModels, global.translatorModels);
 });
 
 test("reasoningOptions leaves the provider default alone when unset and maps off to disabled reasoning", () => {
@@ -82,32 +80,16 @@ test("reasoningOptions leaves the provider default alone when unset and maps off
 	assert.deepEqual(__testing.reasoningOptions("low"), { reasoning: "low" });
 });
 
-test("normalizeTranslatorModel falls back on undefined and clears on null", () => {
-	const fallback = { provider: "ollama", id: "qwen2.5:7b" };
-	assert.deepEqual(__testing.normalizeTranslatorModel(undefined, fallback), fallback);
-	assert.equal(__testing.normalizeTranslatorModel(undefined), undefined);
-	assert.equal(__testing.normalizeTranslatorModel(null, fallback), undefined);
-	assert.equal(__testing.normalizeTranslatorModel(null), undefined);
-	assert.deepEqual(
-		__testing.normalizeTranslatorModel({ provider: "openai" }, fallback),
-		{ provider: "openai", id: "qwen2.5:7b" },
-	);
-	assert.deepEqual(
-		__testing.normalizeTranslatorModel({ id: "gpt-4o-mini" }, fallback),
-		{ provider: "ollama", id: "gpt-4o-mini" },
-	);
-});
-
-test("normalizeTranslatorModel rejects incomplete or non-object models", () => {
-	assert.equal(__testing.normalizeTranslatorModel({ provider: "ollama" }), undefined);
-	assert.equal(__testing.normalizeTranslatorModel({ id: "qwen2.5:7b" }), undefined);
-	assert.equal(__testing.normalizeTranslatorModel({}), undefined);
-	assert.equal(__testing.normalizeTranslatorModel("ollama"), undefined);
-	assert.equal(__testing.normalizeTranslatorModel(123), undefined);
-	assert.deepEqual(__testing.normalizeTranslatorModel({ provider: "ollama", id: "qwen2.5:7b" }), {
-		provider: "ollama",
-		id: "qwen2.5:7b",
-	});
+test("normalizeTranslatorModels rejects non-arrays and incomplete entries instead of dropping them", () => {
+	for (const value of [{ provider: "ollama", id: "x" }, "ollama", 123]) {
+		assert.throws(() => __testing.normalizeTranslatorModels(value, []), /translatorModels must be an array/);
+	}
+	// 链里悄悄少一个模型会改变回退顺序，所以不完整的项让配置无效，而不是被跳过。
+	assert.throws(() => __testing.normalizeTranslatorModels([{ provider: "ollama", id: "a" }, { provider: "ollama" }], []), /translatorModels\[1\]\.id must be a non-empty string/);
+	assert.throws(() => __testing.normalizeTranslatorModels([{ id: "a" }], []), /translatorModels\[0\]\.provider must be a non-empty string/);
+	assert.throws(() => __testing.normalizeTranslatorModels([{ provider: " ", id: "a" }], []), /translatorModels\[0\]\.provider/);
+	assert.throws(() => __testing.normalizeTranslatorModels(["ollama/a"], []), /translatorModels\[0\] must be an object/);
+	assert.deepEqual(__testing.normalizeTranslatorModels([], [{ provider: "ollama", id: "a" }]), []);
 });
 
 test("shouldTranslateLine accepts foreign lines of any length and rejects the rest", () => {
@@ -195,17 +177,21 @@ test("every line the host still displays matches its raw thinking", () => {
 	}
 });
 
-test("cellKey separates translator model, effort, and target language", () => {
-	const base = { ...__testing.DEFAULT_CONFIG, translatorModel: { provider: "ollama", id: "qwen2.5:7b" } };
+test("cellKey separates model chain, order, effort, and target language", () => {
+	const first = { provider: "ollama", id: "qwen2.5:7b" };
+	const second = { provider: "deepseek", id: "flash" };
+	const base = { ...__testing.DEFAULT_CONFIG, translatorModels: [first, second] };
 	const line = "Check the parser first.";
 	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey({ ...base, targetLanguage: "Japanese" }, line));
-	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey({ ...base, translatorModel: { provider: "ollama", id: "other" } }, line));
+	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey({ ...base, translatorModels: [first] }, line));
+	// 顺序决定先用谁，换顺序后同一行要重新翻译。
+	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey({ ...base, translatorModels: [second, first] }, line));
 	// 换推理强度后同一行要重新翻译，不能复用默认强度下的译文。
-	const withEffort = (effort: "off" | "low" | "high") => ({ ...base, translatorModel: { ...base.translatorModel, effort } });
+	const withEffort = (effort: "off" | "low" | "high") => ({ ...base, translatorModels: [{ ...first, effort }, second] });
 	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey(withEffort("low"), line));
 	assert.notEqual(__testing.cellKey(withEffort("low"), line), __testing.cellKey(withEffort("high"), line));
 	assert.notEqual(__testing.cellKey(withEffort("off"), line), __testing.cellKey(withEffort("low"), line));
-	assert.equal(__testing.cellKey(base, line), __testing.cellKey({ ...base }, line));
+	assert.equal(__testing.cellKey(base, line), __testing.cellKey({ ...base, translatorModels: [{ ...first }, { ...second }] }, line));
 });
 
 test("cleanTranslation removes common model wrappers", () => {

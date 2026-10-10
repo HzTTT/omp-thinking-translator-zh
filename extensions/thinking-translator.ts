@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { streamSimple, type Api, type Model, type SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getMarkdownTheme } from "@oh-my-pi/pi-coding-agent";
+import { cfgExpandThinkingBlocks } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { Box, Markdown, Text, node, span } from "@oh-my-pi/pi-tui";
 import type { Component, DescribeContext, NativeEventTarget, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
 
@@ -199,7 +200,9 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 			if (rows.length === 0) return undefined;
 			return { completed, total: cells.length, rows };
 		};
-		// 用户在 Tern 里折叠/展开的结果；没操作过就跟随进度：翻译中展开，译完折叠，与宿主 thinking 一致。
+		// 用户在 Tern 里折叠/展开的结果；没操作过就与宿主 thinking 一致：翻译中展开，译完按宿主
+		// `expandThinkingBlocks` 决定——关时折叠，开时保持展开。设置每次 describe 都从宿主 settings 读，
+		// 用户改设置后下一帧即生效；不缓存副本，宿主是这个值唯一的源头。
 		let userCollapsed: boolean | undefined;
 		// 内容没变就返回同一个节点对象，后端据此跳过这一块的 diff。
 		let lastNode: NativeNode | null = null;
@@ -223,7 +226,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 					return null;
 				}
 				const live = view.completed < view.total;
-				const collapsed = userCollapsed ?? !live;
+				const collapsed = userCollapsed ?? (!live && !cfgExpandThinkingBlocks.get(pi.pi.settings));
 				const text = view.rows.join("\n\n");
 				const nodeSig = `${live ? "L" : "D"}${collapsed ? "C" : "O"}|${heading(view)}|${text}`;
 				if (lastNode && nodeSig === lastNodeSig) return lastNode;

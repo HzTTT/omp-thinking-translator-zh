@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { __testing } from "../extensions/thinking-translator.ts";
-import { formatThinkingForDisplay } from "../node_modules/@oh-my-pi/pi-coding-agent/src/utils/thinking-display.ts";
+import { formatThinkingForDisplay } from "../node_modules/@oh-my-pi/pi-tui/src/chat/thinking-display.ts";
 
 test("config paths honor the active omp agent directory and project root", () => {
 	assert.equal(__testing.getGlobalConfigPath("/profiles/work/agent", "/home/user"), "/profiles/work/agent/thinking-translator.json");
@@ -32,6 +32,13 @@ test("invalid known fields fail closed instead of enabling unexpected requests",
 	for (const value of [null, [], { enabled: "yes" }, { targetLanguage: "" }]) {
 		assert.throws(() => __testing.mergeConfig(__testing.DEFAULT_CONFIG, value));
 	}
+	// 拼错或类型不对的 effort 让整份配置无效，而不是静默回落到模型默认强度。
+	for (const effort of ["fast", "Low", "", 1, true]) {
+		assert.throws(
+			() => __testing.mergeConfig(__testing.DEFAULT_CONFIG, { translatorModel: { provider: "bansos", id: "m", effort } }),
+			/translatorModel\.effort must be one of: off, minimal, low, medium, high, xhigh, max/,
+		);
+	}
 });
 
 test("the removed minLatinChars key is ignored instead of gating translation", () => {
@@ -56,6 +63,23 @@ test("mergeConfig supports partial translatorModel overlay and null clears", () 
 	assert.equal(cleared.translatorModel, undefined);
 	const preserved = __testing.mergeConfig(baseWithModel, {});
 	assert.deepEqual(preserved.translatorModel, { provider: "ollama", id: "qwen2.5:7b" });
+});
+
+test("effort layers per field like provider and id, and null clears it", () => {
+	const global = __testing.mergeConfig(__testing.DEFAULT_CONFIG, {
+		translatorModel: { provider: "bansos", id: "muse", effort: "low" },
+	});
+	// 项目只换模型 id 时保留全局的 effort；只改 effort 时保留全局的模型。
+	assert.deepEqual(__testing.mergeConfig(global, { translatorModel: { id: "ultra" } }).translatorModel, { provider: "bansos", id: "ultra", effort: "low" });
+	assert.deepEqual(__testing.mergeConfig(global, { translatorModel: { effort: "off" } }).translatorModel, { provider: "bansos", id: "muse", effort: "off" });
+	assert.deepEqual(__testing.mergeConfig(global, { translatorModel: { effort: null } }).translatorModel, { provider: "bansos", id: "muse" });
+});
+
+test("reasoningOptions leaves the provider default alone when unset and maps off to disabled reasoning", () => {
+	// 未设置时不能带任何推理字段，否则会覆盖 provider 的默认强度。
+	assert.deepEqual(__testing.reasoningOptions(undefined), {});
+	assert.deepEqual(__testing.reasoningOptions("off"), { disableReasoning: true });
+	assert.deepEqual(__testing.reasoningOptions("low"), { reasoning: "low" });
 });
 
 test("normalizeTranslatorModel falls back on undefined and clears on null", () => {
@@ -171,11 +195,16 @@ test("every line the host still displays matches its raw thinking", () => {
 	}
 });
 
-test("cellKey separates translator model and target language", () => {
+test("cellKey separates translator model, effort, and target language", () => {
 	const base = { ...__testing.DEFAULT_CONFIG, translatorModel: { provider: "ollama", id: "qwen2.5:7b" } };
 	const line = "Check the parser first.";
 	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey({ ...base, targetLanguage: "Japanese" }, line));
 	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey({ ...base, translatorModel: { provider: "ollama", id: "other" } }, line));
+	// 换推理强度后同一行要重新翻译，不能复用默认强度下的译文。
+	const withEffort = (effort: "off" | "low" | "high") => ({ ...base, translatorModel: { ...base.translatorModel, effort } });
+	assert.notEqual(__testing.cellKey(base, line), __testing.cellKey(withEffort("low"), line));
+	assert.notEqual(__testing.cellKey(withEffort("low"), line), __testing.cellKey(withEffort("high"), line));
+	assert.notEqual(__testing.cellKey(withEffort("off"), line), __testing.cellKey(withEffort("low"), line));
 	assert.equal(__testing.cellKey(base, line), __testing.cellKey({ ...base }, line));
 });
 

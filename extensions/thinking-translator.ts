@@ -1,13 +1,17 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { stream, type Api, type Model } from "@oh-my-pi/pi-ai";
+import { streamSimple, type Api, type Model, type SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getMarkdownTheme } from "@oh-my-pi/pi-coding-agent";
 import { Box, Markdown, Text, node, span } from "@oh-my-pi/pi-tui";
 import type { Component, DescribeContext, NativeEventTarget, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui";
 
-type ModelRef = { provider: string; id: string };
+/** 宿主的推理等级（pi-catalog 的 const enum `Effort`）；插件解析不到 pi-catalog，只能从 pi-ai 的选项类型取。 */
+type Effort = NonNullable<SimpleStreamOptions["reasoning"]>;
+/** 配置里的推理强度：宿主等级的字符串取值，加上关闭推理的 `off`。 */
+type EffortSetting = "off" | `${Effort}`;
+type ModelRef = { provider: string; id: string; effort?: EffortSetting };
 type TranslationProgress =
 	| { status: "pending" }
 	| { status: "streaming" | "done"; translation: string }
@@ -93,6 +97,8 @@ function resolveTraceFile(config: ResolvedTranslatorConfig, sessionFile: string 
  * proxy 发现的模型在缓存过期、静态重载后会从注册表消失）。同一 provider 两次发现之间的最短间隔。
  */
 const MODEL_DISCOVERY_COOLDOWN_MS = 60_000;
+/** 宿主 `Effort` 的全部取值；用 Record 表达，宿主增删等级时类型检查会在这里报错。 */
+const EFFORT_LEVELS: Readonly<Record<`${Effort}`, true>> = { minimal: true, low: true, medium: true, high: true, xhigh: true, max: true };
 const lastModelDiscoveryAt = new Map<string, number>();
 const configErrorNotified = new Set<string>();
 const translationFailureNotified = new Set<string>();
@@ -513,11 +519,13 @@ async function streamTranslation(
 	const auth = await getTranslatorAuth(ctx, translatorModel);
 	if (signal.aborted) return;
 	const prompt = buildTranslationPrompt(source, config.targetLanguage);
-	trace("request", { source: source.slice(0, 60), model: `${translatorModel.provider}/${translatorModel.id}`, hasKey: auth.apiKey !== undefined });
-	const eventStream = stream(
+	const effort = config.translatorModel?.effort;
+	trace("request", { source: source.slice(0, 60), model: `${translatorModel.provider}/${translatorModel.id}`, effort: effort ?? "default", hasKey: auth.apiKey !== undefined });
+	// streamSimple 是 pi-ai 唯一把 reasoning/disableReasoning 映射成各 provider wire 字段的入口。
+	const eventStream = streamSimple(
 		translatorModel,
 		{ messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
-		{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(8192, Math.max(1024, Math.ceil(source.length * 1.3))), signal },
+		{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: Math.min(8192, Math.max(1024, Math.ceil(source.length * 1.3))), signal, ...reasoningOptions(effort) },
 	);
 	let translation = "";
 	for await (const event of eventStream) {
@@ -538,10 +546,21 @@ async function streamTranslation(
 	requestRender();
 }
 
-/** 键里带上模型与目标语言，改配置后不会复用上一轮的译文。 */
+/** 键里带上模型、推理强度与目标语言，改配置后不会复用上一轮的译文。 */
 function cellKey(config: ResolvedTranslatorConfig, line: string): string {
 	const model = config.translatorModel;
-	return `${model ? `${model.provider}/${model.id}` : "-"}\u0000${config.targetLanguage}\u0000${line}`;
+	return `${model ? `${model.provider}/${model.id}@${model.effort ?? "default"}` : "-"}\u0000${config.targetLanguage}\u0000${line}`;
+}
+
+/**
+ * 未设置时两个字段都不发，沿用模型/provider 的默认强度；等级是否被该模型支持由 pi-ai 判定
+ * （`requireSupportedEffort` 抛错，走重试与失败行），插件不另存一份支持列表。
+ */
+function reasoningOptions(effort: EffortSetting | undefined): Pick<SimpleStreamOptions, "reasoning" | "disableReasoning"> {
+	if (effort === undefined) return {};
+	if (effort === "off") return { disableReasoning: true };
+	// const enum 的成员类型不接受字符串字面量；两者取值一一对应，由 EFFORT_LEVELS 的 Record 类型保证。
+	return { reasoning: effort as Effort };
 }
 
 /** 按换行符分行，只保留含拉丁字母的非空行；重复行由调用方按缓存合并。 */
@@ -668,14 +687,25 @@ function mergeConfig(base: ResolvedTranslatorConfig, value: unknown): ResolvedTr
 	};
 }
 
-/** 只有 provider 和 id 都存在时才把模型引用视为可用。 */
+/** 只有 provider 和 id 都存在时才把模型引用视为可用；effort 与二者一样按字段覆盖，`null` 清除。 */
 function normalizeTranslatorModel(value: unknown, fallback?: ModelRef): ModelRef | undefined {
 	if (value === undefined) return fallback;
 	if (!value || typeof value !== "object") return undefined;
 	const raw = value as Record<string, unknown>;
 	const provider = typeof raw.provider === "string" ? raw.provider : fallback?.provider;
 	const id = typeof raw.id === "string" ? raw.id : fallback?.id;
-	return provider && id ? { provider, id } : undefined;
+	const effort = raw.effort === undefined ? fallback?.effort : raw.effort === null ? undefined : parseEffortSetting(raw.effort);
+	return provider && id ? { provider, id, ...(effort ? { effort } : {}) } : undefined;
+}
+
+/** 配置边界：只接受 `off` 与宿主等级；其他值抛错，交给配置错误策略禁用翻译，拼错不会静默回落默认。 */
+function parseEffortSetting(value: unknown): EffortSetting {
+	if (value === "off" || (typeof value === "string" && isEffortLevel(value))) return value;
+	throw new Error(`translatorModel.effort must be one of: off, ${Object.keys(EFFORT_LEVELS).join(", ")}`);
+}
+
+function isEffortLevel(value: string): value is `${Effort}` {
+	return Object.hasOwn(EFFORT_LEVELS, value);
 }
 
 /** 同一路径只提示一次配置错误，避免每个消息周期刷屏。 */
@@ -741,20 +771,26 @@ function notifyTranslationFailure(ctx: NotifierContext, error: unknown): void {
 async function showConfigStatus(ctx: ExtensionContext): Promise<void> {
 	const state = loadConfigState(ctx);
 	const modelRef = state.config.translatorModel;
+	let model: Model<Api> | undefined;
 	let modelStatus = "not configured";
 	if (modelRef) {
-		if (ctx.modelRegistry.find(modelRef.provider, modelRef.id)) modelStatus = "available";
+		model = ctx.modelRegistry.find(modelRef.provider, modelRef.id);
+		if (model) modelStatus = "available";
 		else {
 			lastModelDiscoveryAt.delete(modelRef.provider);
-			modelStatus = (await discoverTranslatorModel(ctx, modelRef)) ? "available (after discovery)" : "not found (after discovery)";
+			model = await discoverTranslatorModel(ctx, modelRef);
+			modelStatus = model ? "available (after discovery)" : "not found (after discovery)";
 		}
 	}
+	// 支持哪些等级以模型目录为准；这里只展示，供用户对照 effort 设置。
+	const modelEfforts = !model ? "unknown" : !model.reasoning ? "none (non-reasoning model)" : model.thinking?.efforts.join(", ") || "none (no effort control)";
 	const lines = [
 		"thinking-translator status",
 		`enabled: ${state.config.enabled}`,
 		`targetLanguage: ${state.config.targetLanguage}`,
 		`translatorModel: ${modelRef ? `${modelRef.provider}/${modelRef.id}` : "not configured"}`,
 		`model: ${modelStatus}`,
+		`effort: ${modelRef?.effort ?? "model default"} (model supports: ${modelEfforts})`,
 		`trace: ${resolveTraceFile(state.config, ctx.sessionManager.getSessionFile()) ?? "off"}`,
 		...state.paths.map((info) => `${info.scope} config: ${info.path} (${info.exists ? "found" : "not found"})`),
 		...state.errors.map((item) => `${item.scope} config error: ${item.error instanceof Error ? item.error.message : String(item.error)}`),
@@ -857,6 +893,7 @@ export const __testing = {
 	getGlobalConfigPath,
 	mergeConfig,
 	normalizeTranslatorModel,
+	reasoningOptions,
 	shouldTranslateLine,
 	splitTranslationLines,
 } as const;

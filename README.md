@@ -26,8 +26,14 @@ This extension is omp-only, not a pi extension. It is built on omp's extension A
 
 This extension is installed from git; it is not published to any package registry.
 
+This fork (`HzTTT/omp-thinking-translator-zh`) differs from upstream in one way: the Tern
+native section carries its own roles (`thinking-zh.box` / `thinking-zh.live`) instead of the
+host's `omp.thinking` roles, so a Tern-side CSS plugin can hide the host's original English
+thinking sections while keeping this fork's translation boxes visible. Pair it with a Tern
+plugin whose styles hide `[data-role='omp.thinking']` and `[data-role='omp.thinking.live']`.
+
 ```bash
-omp plugin install git:github.com/Mouriya-Emma/omp-thinking-translator
+omp plugin install git+https://github.com/HzTTT/omp-thinking-translator-zh
 ```
 
 For local development, either load the extension file directly:
@@ -49,7 +55,7 @@ The manifest key is `omp.extensions`, and the pinned `@oh-my-pi/*` 18.8.7 packag
 1. Install the extension:
 
    ```bash
-   omp plugin install git:github.com/Mouriya-Emma/omp-thinking-translator
+   omp plugin install git+https://github.com/HzTTT/omp-thinking-translator-zh
    ```
 
 2. Create a global config template from inside omp:

@@ -215,7 +215,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 				body.setText(view.rows.join("\n\n"));
 				return box.render(width);
 			},
-			// Tern Surface Protocol：与宿主 thinking 同构的 section（role omp.thinking*），ANSI 终端不会走到这里。
+			// Tern Surface Protocol：独立 role（thinking-zh.*），与宿主 omp.thinking 区分，供 Tern 端 CSS 选择性隐藏宿主原文；ANSI 终端不会走到这里。
 			describe(cx: DescribeContext): NativeNode | null {
 				nativeSeen = true;
 				if (!cx.supports("section") || !cx.supports("md")) return null;
@@ -237,7 +237,7 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 					: node("text", { spans: [span(label, "muted")] }, undefined, "head");
 				lastNode = node(
 					"section",
-					{ role: live ? "omp.thinking.live" : "omp.thinking", collapsible: true, collapsed },
+					{ role: live ? "thinking-zh.live" : "thinking-zh.box", collapsible: true, collapsed },
 					[head, node("md", live ? { text, stream: true } : { text }, undefined, "body")],
 				);
 				lastNodeSig = nodeSig;

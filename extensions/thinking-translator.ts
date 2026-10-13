@@ -161,7 +161,8 @@ export default function thinkingTranslator(pi: ExtensionAPI) {
 		const body = new Markdown("", 0, 0, getMarkdownTheme());
 		box.addChild(title);
 		box.addChild(body);
-		const heading = (view: TranslationView): string => `思考翻译 · 块 ${context.thinkingIndex + 1} · ${view.completed}/${view.total}`;
+		const heading = (view: TranslationView): string =>
+			view.completed < view.total ? `翻译中 ${view.completed}/${view.total}` : `思考翻译`;
 		/** ANSI 行与原生描述共用：分发、取格、标记 painted；没有可画的正文时返回 undefined。 */
 		const collect = (width: number | undefined): TranslationView | undefined => {
 			dispatch(sources, context.requestRender, blockLabel);
